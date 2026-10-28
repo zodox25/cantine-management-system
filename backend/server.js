@@ -9,26 +9,50 @@ const jwt = require("jsonwebtoken");
 
 const app = express();
 
-app.use(cors());
-app.use(express.json({ limit: "1mb" }));
+// ---------------- CONFIGURATION ----------------
 
-const PORT = process.env.PORT || 5000;
+const PORT = Number(process.env.PORT) || 5000;
 const JWT_SECRET = process.env.JWT_SECRET;
 
 if (!JWT_SECRET || JWT_SECRET.length < 32) {
-  console.error("ERROR: Set JWT_SECRET to a random secret of at least 32 characters in .env");
+  console.error(
+    "ERROR: Set JWT_SECRET to a random secret of at least 32 characters."
+  );
   process.exit(1);
 }
 
+app.use(cors());
+app.use(express.json({ limit: "1mb" }));
+
+// Aiven: set DB_SSL=true.
+// For production, preferably provide the Aiven CA certificate in DB_SSL_CA.
+// DB_SSL_REJECT_UNAUTHORIZED=false is a fallback that encrypts the connection
+// but does not verify the server certificate.
+const sslEnabled = String(process.env.DB_SSL || "false").toLowerCase() === "true";
+const sslCA = process.env.DB_SSL_CA;
+
 const pool = mysql.createPool({
   host: process.env.DB_HOST || "localhost",
+  port: Number(process.env.DB_PORT) || 3306,
   user: process.env.DB_USER || "root",
   password: process.env.DB_PASSWORD || "",
   database: process.env.DB_NAME || "cantine_db",
+
+  ssl: sslEnabled
+    ? sslCA
+      ? { ca: sslCA, rejectUnauthorized: true }
+      : {
+          rejectUnauthorized:
+            String(process.env.DB_SSL_REJECT_UNAUTHORIZED || "false")
+              .toLowerCase() === "true",
+        }
+    : undefined,
+
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
   decimalNumbers: true,
+  connectTimeout: 20000,
 });
 
 // ---------------- HELPERS ----------------
@@ -37,13 +61,17 @@ const asyncHandler = (fn) => (req, res, next) =>
   Promise.resolve(fn(req, res, next)).catch(next);
 
 const positiveNumber = (value) =>
-  value !== undefined && value !== null &&
-  value !== "" && Number.isFinite(Number(value)) &&
+  value !== undefined &&
+  value !== null &&
+  value !== "" &&
+  Number.isFinite(Number(value)) &&
   Number(value) > 0;
 
 const nonNegativeNumber = (value) =>
-  value !== undefined && value !== null &&
-  value !== "" && Number.isFinite(Number(value)) &&
+  value !== undefined &&
+  value !== null &&
+  value !== "" &&
+  Number.isFinite(Number(value)) &&
   Number(value) >= 0;
 
 function makeToken(user) {
@@ -72,9 +100,11 @@ function publicUser(user) {
 
 async function getUserById(id) {
   const [rows] = await pool.execute(
-    "SELECT id, name, username, role, status, created_at FROM users WHERE id = ? LIMIT 1",
+    `SELECT id, name, username, role, status, created_at
+     FROM users WHERE id = ? LIMIT 1`,
     [id]
   );
+
   return rows[0] || null;
 }
 
@@ -93,10 +123,13 @@ async function recordStockMovement(
   );
 }
 
-async function requireAdmin(req, res, next) {
+function requireAdmin(req, res, next) {
   if (!req.user || req.user.role !== "admin") {
-    return res.status(403).json({ message: "Admin permission required." });
+    return res.status(403).json({
+      message: "Admin permission required.",
+    });
   }
+
   next();
 }
 
@@ -104,10 +137,14 @@ async function requireAdmin(req, res, next) {
 
 async function authenticate(req, res, next) {
   const header = req.headers.authorization || "";
-  const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+  const token = header.startsWith("Bearer ")
+    ? header.slice(7)
+    : null;
 
   if (!token) {
-    return res.status(401).json({ message: "Please log in first." });
+    return res.status(401).json({
+      message: "Please log in first.",
+    });
   }
 
   try {
@@ -115,7 +152,9 @@ async function authenticate(req, res, next) {
     const user = await getUserById(decoded.id);
 
     if (!user) {
-      return res.status(401).json({ message: "User no longer exists." });
+      return res.status(401).json({
+        message: "User no longer exists.",
+      });
     }
 
     if (user.status !== "approved") {
@@ -128,15 +167,38 @@ async function authenticate(req, res, next) {
     req.user = user;
     next();
   } catch (error) {
-    return res.status(401).json({ message: "Invalid or expired token." });
+    if (error.code) {
+      return next(error);
+    }
+
+    return res.status(401).json({
+      message: "Invalid or expired token.",
+    });
   }
 }
 
+// ---------------- HEALTH CHECKS ----------------
+
 app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", message: "Cantine API is running." });
+  res.json({
+    status: "ok",
+    message: "Cantine API is running.",
+  });
 });
 
-// Register: first account becomes admin; later accounts await approval.
+app.get("/api/health/db", asyncHandler(async (req, res) => {
+  const [rows] = await pool.query("SELECT 1 AS database_connected");
+
+  res.json({
+    status: "ok",
+    database: "connected",
+    result: rows[0].database_connected,
+  });
+}));
+
+// ---------------- REGISTER ----------------
+// First account becomes admin. Later accounts await admin approval.
+
 app.post("/api/auth/register", asyncHandler(async (req, res) => {
   const name = String(req.body.name || "").trim();
   const username = String(req.body.username || "").trim().toLowerCase();
@@ -144,14 +206,17 @@ app.post("/api/auth/register", asyncHandler(async (req, res) => {
 
   if (name.length < 2 || username.length < 3 || password.length < 8) {
     return res.status(400).json({
-      message: "Name must have at least 2 characters, username 3, and password 8.",
+      message:
+        "Name must have at least 2 characters, username 3, and password 8.",
     });
   }
 
   const connection = await pool.getConnection();
+  let transactionStarted = false;
 
   try {
     await connection.beginTransaction();
+    transactionStarted = true;
 
     const [existing] = await connection.execute(
       "SELECT id FROM users WHERE username = ? LIMIT 1",
@@ -160,7 +225,11 @@ app.post("/api/auth/register", asyncHandler(async (req, res) => {
 
     if (existing.length) {
       await connection.rollback();
-      return res.status(409).json({ message: "Username already exists." });
+      transactionStarted = false;
+
+      return res.status(409).json({
+        message: "Username already exists.",
+      });
     }
 
     const [countRows] = await connection.execute(
@@ -179,6 +248,7 @@ app.post("/api/auth/register", asyncHandler(async (req, res) => {
     );
 
     await connection.commit();
+    transactionStarted = false;
 
     const user = await getUserById(result.insertId);
 
@@ -195,19 +265,26 @@ app.post("/api/auth/register", asyncHandler(async (req, res) => {
       token: makeToken(user),
     });
   } catch (error) {
-    await connection.rollback();
+    if (transactionStarted) {
+      await connection.rollback();
+    }
+
     throw error;
   } finally {
     connection.release();
   }
 }));
 
+// ---------------- LOGIN ----------------
+
 app.post("/api/auth/login", asyncHandler(async (req, res) => {
   const username = String(req.body.username || "").trim().toLowerCase();
   const password = String(req.body.password || "");
 
   if (!username || !password) {
-    return res.status(400).json({ message: "Enter username and password." });
+    return res.status(400).json({
+      message: "Enter username and password.",
+    });
   }
 
   const [rows] = await pool.execute(
@@ -219,7 +296,9 @@ app.post("/api/auth/login", asyncHandler(async (req, res) => {
   const user = rows[0];
 
   if (!user || !(await bcrypt.compare(password, user.password))) {
-    return res.status(401).json({ message: "Invalid username or password." });
+    return res.status(401).json({
+      message: "Invalid username or password.",
+    });
   }
 
   if (user.status !== "approved") {
@@ -247,65 +326,99 @@ app.get("/api/users", authenticate, requireAdmin, asyncHandler(async (req, res) 
     `SELECT id, name, username, role, status, created_at
      FROM users ORDER BY id DESC`
   );
+
   res.json(users);
 }));
 
-app.patch("/api/users/:id/status", authenticate, requireAdmin, asyncHandler(async (req, res) => {
-  const id = Number(req.params.id);
-  const status = String(req.body.status || "");
+app.patch(
+  "/api/users/:id/status",
+  authenticate,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    const status = String(req.body.status || "");
 
-  if (!Number.isInteger(id) || id < 1 ||
-      !["pending", "approved", "rejected"].includes(status)) {
-    return res.status(400).json({ message: "Invalid user ID or status." });
-  }
+    if (
+      !Number.isInteger(id) ||
+      id < 1 ||
+      !["pending", "approved", "rejected"].includes(status)
+    ) {
+      return res.status(400).json({
+        message: "Invalid user ID or status.",
+      });
+    }
 
-  if (id === req.user.id && status !== "approved") {
-    return res.status(400).json({ message: "You cannot suspend your own account." });
-  }
+    if (id === req.user.id && status !== "approved") {
+      return res.status(400).json({
+        message: "You cannot suspend your own account.",
+      });
+    }
 
-  const [result] = await pool.execute(
-    "UPDATE users SET status = ? WHERE id = ?",
-    [status, id]
-  );
+    const [result] = await pool.execute(
+      "UPDATE users SET status = ? WHERE id = ?",
+      [status, id]
+    );
 
-  if (!result.affectedRows) {
-    return res.status(404).json({ message: "User not found." });
-  }
+    if (!result.affectedRows) {
+      return res.status(404).json({ message: "User not found." });
+    }
 
-  res.json({ message: "User status updated.", user: await getUserById(id) });
-}));
+    res.json({
+      message: "User status updated.",
+      user: await getUserById(id),
+    });
+  })
+);
 
-app.patch("/api/users/:id/role", authenticate, requireAdmin, asyncHandler(async (req, res) => {
-  const id = Number(req.params.id);
-  const role = String(req.body.role || "");
+app.patch(
+  "/api/users/:id/role",
+  authenticate,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    const role = String(req.body.role || "");
 
-  if (!Number.isInteger(id) || id < 1 || !["admin", "user"].includes(role)) {
-    return res.status(400).json({ message: "Invalid user ID or role." });
-  }
+    if (
+      !Number.isInteger(id) ||
+      id < 1 ||
+      !["admin", "user"].includes(role)
+    ) {
+      return res.status(400).json({
+        message: "Invalid user ID or role.",
+      });
+    }
 
-  if (id === req.user.id && role !== "admin") {
-    return res.status(400).json({ message: "You cannot remove your own admin role." });
-  }
+    if (id === req.user.id && role !== "admin") {
+      return res.status(400).json({
+        message: "You cannot remove your own admin role.",
+      });
+    }
 
-  const [result] = await pool.execute(
-    "UPDATE users SET role = ? WHERE id = ?",
-    [role, id]
-  );
+    const [result] = await pool.execute(
+      "UPDATE users SET role = ? WHERE id = ?",
+      [role, id]
+    );
 
-  if (!result.affectedRows) {
-    return res.status(404).json({ message: "User not found." });
-  }
+    if (!result.affectedRows) {
+      return res.status(404).json({ message: "User not found." });
+    }
 
-  res.json({ message: "User role updated.", user: await getUserById(id) });
-}));
+    res.json({
+      message: "User role updated.",
+      user: await getUserById(id),
+    });
+  })
+);
 
 // ---------------- PRODUCTS ----------------
 
 app.get("/api/products", authenticate, asyncHandler(async (req, res) => {
   const [products] = await pool.execute(
-    `SELECT id, name, opening_stock, stock, purchase_price, selling_price, created_at
+    `SELECT id, name, opening_stock, stock, purchase_price,
+            selling_price, created_at
      FROM products ORDER BY name ASC`
   );
+
   res.json(products);
 }));
 
@@ -323,43 +436,64 @@ app.post("/api/products", authenticate, asyncHandler(async (req, res) => {
     !Number.isInteger(Number(openingStock))
   ) {
     return res.status(400).json({
-      message: "Enter product name, valid opening stock, purchase price and selling price.",
+      message:
+        "Enter product name, valid opening stock, purchase price and selling price.",
     });
   }
 
   const connection = await pool.getConnection();
+  let transactionStarted = false;
 
   try {
     await connection.beginTransaction();
+    transactionStarted = true;
 
     const [result] = await connection.execute(
       `INSERT INTO products
        (name, opening_stock, stock, purchase_price, selling_price)
        VALUES (?, ?, ?, ?, ?)`,
-      [name, Number(openingStock), Number(openingStock),
-       Number(purchasePrice), Number(sellingPrice)]
+      [
+        name,
+        Number(openingStock),
+        Number(openingStock),
+        Number(purchasePrice),
+        Number(sellingPrice),
+      ]
     );
 
     if (Number(openingStock) > 0) {
       await recordStockMovement(
-        connection, result.insertId, Number(openingStock), "opening", req.user.id
+        connection,
+        result.insertId,
+        Number(openingStock),
+        "opening",
+        req.user.id
       );
     }
 
     await connection.commit();
+    transactionStarted = false;
 
     const [rows] = await pool.execute(
       "SELECT * FROM products WHERE id = ?",
       [result.insertId]
     );
 
-    res.status(201).json({ message: "Product registered.", product: rows[0] });
+    res.status(201).json({
+      message: "Product registered.",
+      product: rows[0],
+    });
   } catch (error) {
-    await connection.rollback();
+    if (transactionStarted) {
+      await connection.rollback();
+    }
 
     if (error.code === "ER_DUP_ENTRY") {
-      return res.status(409).json({ message: "A product with that name already exists." });
+      return res.status(409).json({
+        message: "A product with that name already exists.",
+      });
     }
+
     throw error;
   } finally {
     connection.release();
@@ -372,9 +506,16 @@ app.put("/api/products/:id", authenticate, asyncHandler(async (req, res) => {
   const purchasePrice = req.body.purchase_price ?? req.body.purchasePrice;
   const sellingPrice = req.body.selling_price ?? req.body.sellingPrice;
 
-  if (!Number.isInteger(id) || id < 1 || !name ||
-      !nonNegativeNumber(purchasePrice) || !positiveNumber(sellingPrice)) {
-    return res.status(400).json({ message: "Invalid product information." });
+  if (
+    !Number.isInteger(id) ||
+    id < 1 ||
+    !name ||
+    !nonNegativeNumber(purchasePrice) ||
+    !positiveNumber(sellingPrice)
+  ) {
+    return res.status(400).json({
+      message: "Invalid product information.",
+    });
   }
 
   try {
@@ -386,57 +527,94 @@ app.put("/api/products/:id", authenticate, asyncHandler(async (req, res) => {
     );
 
     if (!result.affectedRows) {
-      const [check] = await pool.execute("SELECT id FROM products WHERE id = ?", [id]);
-      if (!check.length) return res.status(404).json({ message: "Product not found." });
+      const [check] = await pool.execute(
+        "SELECT id FROM products WHERE id = ?",
+        [id]
+      );
+
+      if (!check.length) {
+        return res.status(404).json({ message: "Product not found." });
+      }
     }
 
-    const [rows] = await pool.execute("SELECT * FROM products WHERE id = ?", [id]);
-    res.json({ message: "Product updated.", product: rows[0] });
+    const [rows] = await pool.execute(
+      "SELECT * FROM products WHERE id = ?",
+      [id]
+    );
+
+    res.json({
+      message: "Product updated.",
+      product: rows[0],
+    });
   } catch (error) {
     if (error.code === "ER_DUP_ENTRY") {
-      return res.status(409).json({ message: "Another product has that name." });
-    }
-    throw error;
-  }
-}));
-
-app.delete("/api/products/:id", authenticate, requireAdmin, asyncHandler(async (req, res) => {
-  const id = Number(req.params.id);
-
-  try {
-    const [result] = await pool.execute("DELETE FROM products WHERE id = ?", [id]);
-
-    if (!result.affectedRows) {
-      return res.status(404).json({ message: "Product not found." });
-    }
-
-    res.json({ message: "Product deleted." });
-  } catch (error) {
-    if (error.code === "ER_ROW_IS_REFERENCED_2") {
       return res.status(409).json({
-        message: "This product has sales or stock history and cannot be deleted. Keep it for reporting.",
+        message: "Another product has that name.",
       });
     }
+
     throw error;
   }
 }));
+
+app.delete(
+  "/api/products/:id",
+  authenticate,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+
+    if (!Number.isInteger(id) || id < 1) {
+      return res.status(400).json({ message: "Invalid product ID." });
+    }
+
+    try {
+      const [result] = await pool.execute(
+        "DELETE FROM products WHERE id = ?",
+        [id]
+      );
+
+      if (!result.affectedRows) {
+        return res.status(404).json({ message: "Product not found." });
+      }
+
+      res.json({ message: "Product deleted." });
+    } catch (error) {
+      if (error.code === "ER_ROW_IS_REFERENCED_2") {
+        return res.status(409).json({
+          message:
+            "This product has sales or stock history and cannot be deleted. Keep it for reporting.",
+        });
+      }
+
+      throw error;
+    }
+  })
+);
 
 // ---------------- STOCK / PURCHASES ----------------
 
-// Add purchased bottles to stock.
 app.post("/api/stock/purchase", authenticate, asyncHandler(async (req, res) => {
   const productId = Number(req.body.product_id ?? req.body.productId);
   const quantity = Number(req.body.quantity);
 
-  if (!Number.isInteger(productId) || productId < 1 ||
-      !Number.isInteger(quantity) || quantity < 1) {
-    return res.status(400).json({ message: "Product ID and positive whole-number quantity are required." });
+  if (
+    !Number.isInteger(productId) ||
+    productId < 1 ||
+    !Number.isInteger(quantity) ||
+    quantity < 1
+  ) {
+    return res.status(400).json({
+      message: "Product ID and positive whole-number quantity are required.",
+    });
   }
 
   const connection = await pool.getConnection();
+  let transactionStarted = false;
 
   try {
     await connection.beginTransaction();
+    transactionStarted = true;
 
     const [products] = await connection.execute(
       "SELECT id, stock FROM products WHERE id = ? FOR UPDATE",
@@ -445,6 +623,8 @@ app.post("/api/stock/purchase", authenticate, asyncHandler(async (req, res) => {
 
     if (!products.length) {
       await connection.rollback();
+      transactionStarted = false;
+
       return res.status(404).json({ message: "Product not found." });
     }
 
@@ -454,13 +634,19 @@ app.post("/api/stock/purchase", authenticate, asyncHandler(async (req, res) => {
     );
 
     await recordStockMovement(
-      connection, productId, quantity, "purchase", req.user.id
+      connection,
+      productId,
+      quantity,
+      "purchase",
+      req.user.id
     );
 
     await connection.commit();
+    transactionStarted = false;
 
     const [updated] = await pool.execute(
-      "SELECT * FROM products WHERE id = ?", [productId]
+      "SELECT * FROM products WHERE id = ?",
+      [productId]
     );
 
     res.status(201).json({
@@ -468,7 +654,10 @@ app.post("/api/stock/purchase", authenticate, asyncHandler(async (req, res) => {
       product: updated[0],
     });
   } catch (error) {
-    await connection.rollback();
+    if (transactionStarted) {
+      await connection.rollback();
+    }
+
     throw error;
   } finally {
     connection.release();
@@ -486,28 +675,33 @@ app.get("/api/stock/movements", authenticate, asyncHandler(async (req, res) => {
      ORDER BY sm.created_at DESC
      LIMIT 1000`
   );
+
   res.json(rows);
 }));
 
 // ---------------- SALES ----------------
 
-// Sale request: { product_id, quantity }
-// Stock decrement and sale insert happen in one DB transaction.
 app.post("/api/sales", authenticate, asyncHandler(async (req, res) => {
   const productId = Number(req.body.product_id ?? req.body.productId);
   const quantity = Number(req.body.quantity);
 
-  if (!Number.isInteger(productId) || productId < 1 ||
-      !Number.isInteger(quantity) || quantity < 1) {
+  if (
+    !Number.isInteger(productId) ||
+    productId < 1 ||
+    !Number.isInteger(quantity) ||
+    quantity < 1
+  ) {
     return res.status(400).json({
       message: "Product ID and quantity must be positive whole numbers.",
     });
   }
 
   const connection = await pool.getConnection();
+  let transactionStarted = false;
 
   try {
     await connection.beginTransaction();
+    transactionStarted = true;
 
     const [products] = await connection.execute(
       `SELECT id, name, stock, purchase_price, selling_price
@@ -517,6 +711,8 @@ app.post("/api/sales", authenticate, asyncHandler(async (req, res) => {
 
     if (!products.length) {
       await connection.rollback();
+      transactionStarted = false;
+
       return res.status(404).json({ message: "Product not found." });
     }
 
@@ -524,6 +720,8 @@ app.post("/api/sales", authenticate, asyncHandler(async (req, res) => {
 
     if (Number(product.stock) < quantity) {
       await connection.rollback();
+      transactionStarted = false;
+
       return res.status(400).json({
         message: `Insufficient stock. Available: ${product.stock} bottles.`,
       });
@@ -538,7 +736,15 @@ app.post("/api/sales", authenticate, asyncHandler(async (req, res) => {
       `INSERT INTO sales
        (product_id, quantity, unit_price, unit_cost, total, cost, employee_id)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [productId, quantity, unitPrice, unitCost, total, cost, req.user.id]
+      [
+        productId,
+        quantity,
+        unitPrice,
+        unitCost,
+        total,
+        cost,
+        req.user.id,
+      ]
     );
 
     await connection.execute(
@@ -547,10 +753,15 @@ app.post("/api/sales", authenticate, asyncHandler(async (req, res) => {
     );
 
     await recordStockMovement(
-      connection, productId, -quantity, "sale", req.user.id
+      connection,
+      productId,
+      -quantity,
+      "sale",
+      req.user.id
     );
 
     await connection.commit();
+    transactionStarted = false;
 
     const [sales] = await pool.execute(
       `SELECT s.id, s.product_id, p.name AS product_name, s.quantity,
@@ -564,9 +775,15 @@ app.post("/api/sales", authenticate, asyncHandler(async (req, res) => {
       [saleResult.insertId]
     );
 
-    res.status(201).json({ message: "Sale recorded.", sale: sales[0] });
+    res.status(201).json({
+      message: "Sale recorded.",
+      sale: sales[0],
+    });
   } catch (error) {
-    await connection.rollback();
+    if (transactionStarted) {
+      await connection.rollback();
+    }
+
     throw error;
   } finally {
     connection.release();
@@ -663,11 +880,18 @@ app.post("/api/expenses", authenticate, asyncHandler(async (req, res) => {
     [result.insertId]
   );
 
-  res.status(201).json({ message: "Expense recorded.", expense: rows[0] });
+  res.status(201).json({
+    message: "Expense recorded.",
+    expense: rows[0],
+  });
 }));
 
 app.delete("/api/expenses/:id", authenticate, asyncHandler(async (req, res) => {
   const id = Number(req.params.id);
+
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(400).json({ message: "Invalid expense ID." });
+  }
 
   const [rows] = await pool.execute(
     "SELECT id, employee_id FROM expenses WHERE id = ?",
@@ -678,71 +902,90 @@ app.delete("/api/expenses/:id", authenticate, asyncHandler(async (req, res) => {
     return res.status(404).json({ message: "Expense not found." });
   }
 
-  if (req.user.role !== "admin" &&
-      Number(rows[0].employee_id) !== Number(req.user.id)) {
-    return res.status(403).json({ message: "You can only delete your own expenses." });
+  if (
+    req.user.role !== "admin" &&
+    Number(rows[0].employee_id) !== Number(req.user.id)
+  ) {
+    return res.status(403).json({
+      message: "You can only delete your own expenses.",
+    });
   }
 
   await pool.execute("DELETE FROM expenses WHERE id = ?", [id]);
+
   res.json({ message: "Expense deleted." });
 }));
 
 // ---------------- REPORTS / DASHBOARD ----------------
 
-app.get("/api/reports/summary", authenticate, asyncHandler(async (req, res) => {
-  const date = String(req.query.date || new Date().toISOString().slice(0, 10));
+app.get(
+  "/api/reports/summary",
+  authenticate,
+  asyncHandler(async (req, res) => {
+    const date = String(
+      req.query.date || new Date().toISOString().slice(0, 10)
+    );
 
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-    return res.status(400).json({ message: "Date must use YYYY-MM-DD format." });
-  }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return res.status(400).json({
+        message: "Date must use YYYY-MM-DD format.",
+      });
+    }
 
-  const [[sales]] = await pool.execute(
-    `SELECT
-       COALESCE(SUM(quantity), 0) AS bottles_sold,
-       COALESCE(SUM(total), 0) AS revenue,
-       COALESCE(SUM(cost), 0) AS cost_of_goods,
-       COALESCE(SUM(total - cost), 0) AS gross_profit,
-       COUNT(*) AS sale_count
-     FROM sales WHERE DATE(created_at) = ?`,
-    [date]
-  );
+    const [[sales]] = await pool.execute(
+      `SELECT
+         COALESCE(SUM(quantity), 0) AS bottles_sold,
+         COALESCE(SUM(total), 0) AS revenue,
+         COALESCE(SUM(cost), 0) AS cost_of_goods,
+         COALESCE(SUM(total - cost), 0) AS gross_profit,
+         COUNT(*) AS sale_count
+       FROM sales WHERE DATE(created_at) = ?`,
+      [date]
+    );
 
-  const [[expenses]] = await pool.execute(
-    `SELECT COALESCE(SUM(amount), 0) AS expenses
-     FROM expenses WHERE DATE(created_at) = ?`,
-    [date]
-  );
+    const [[expenses]] = await pool.execute(
+      `SELECT COALESCE(SUM(amount), 0) AS expenses
+       FROM expenses WHERE DATE(created_at) = ?`,
+      [date]
+    );
 
-  const [[stock]] = await pool.execute(
-    `SELECT COUNT(*) AS product_count,
-            COALESCE(SUM(stock), 0) AS bottles_in_stock
-     FROM products`
-  );
+    const [[stock]] = await pool.execute(
+      `SELECT COUNT(*) AS product_count,
+              COALESCE(SUM(stock), 0) AS bottles_in_stock
+       FROM products`
+    );
 
-  const netProfit = Number(sales.gross_profit) - Number(expenses.expenses);
+    const netProfit =
+      Number(sales.gross_profit) - Number(expenses.expenses);
 
-  res.json({
-    date,
-    bottles_sold: Number(sales.bottles_sold),
-    revenue: Number(sales.revenue),
-    cost_of_goods: Number(sales.cost_of_goods),
-    gross_profit: Number(sales.gross_profit),
-    expenses: Number(expenses.expenses),
-    net_profit: Number(netProfit.toFixed(2)),
-    sale_count: Number(sales.sale_count),
-    product_count: Number(stock.product_count),
-    bottles_in_stock: Number(stock.bottles_in_stock),
-    currency: "RWF",
-  });
-}));
+    res.json({
+      date,
+      bottles_sold: Number(sales.bottles_sold),
+      revenue: Number(sales.revenue),
+      cost_of_goods: Number(sales.cost_of_goods),
+      gross_profit: Number(sales.gross_profit),
+      expenses: Number(expenses.expenses),
+      net_profit: Number(netProfit.toFixed(2)),
+      sale_count: Number(sales.sale_count),
+      product_count: Number(stock.product_count),
+      bottles_in_stock: Number(stock.bottles_in_stock),
+      currency: "RWF",
+    });
+  })
+);
 
 app.get("/api/reports/daily", authenticate, asyncHandler(async (req, res) => {
   const from = req.query.from || new Date().toISOString().slice(0, 10);
   const to = req.query.to || from;
 
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(from) ||
-      !/^\d{4}-\d{2}-\d{2}$/.test(to) || from > to) {
-    return res.status(400).json({ message: "Provide valid from/to dates in YYYY-MM-DD format." });
+  if (
+    !/^\d{4}-\d{2}-\d{2}$/.test(from) ||
+    !/^\d{4}-\d{2}-\d{2}$/.test(to) ||
+    from > to
+  ) {
+    return res.status(400).json({
+      message: "Provide valid from/to dates in YYYY-MM-DD format.",
+    });
   }
 
   const [rows] = await pool.execute(
@@ -771,7 +1014,8 @@ app.get("/api/reports/daily", authenticate, asyncHandler(async (req, res) => {
        GROUP BY DATE(created_at)
      ) s ON s.sale_date = d.report_date
      LEFT JOIN (
-       SELECT DATE(created_at) AS expense_date, SUM(amount) AS expenses
+       SELECT DATE(created_at) AS expense_date,
+              SUM(amount) AS expenses
        FROM expenses
        WHERE DATE(created_at) BETWEEN ? AND ?
        GROUP BY DATE(created_at)
@@ -796,6 +1040,7 @@ app.get("/api/reports/products", authenticate, asyncHandler(async (req, res) => 
               p.purchase_price, p.selling_price
      ORDER BY p.name ASC`
   );
+
   res.json(rows);
 }));
 
@@ -811,21 +1056,49 @@ app.use((req, res) => {
 app.use((error, req, res, next) => {
   console.error("API error:", error.code || error.message);
 
+  if (res.headersSent) {
+    return next(error);
+  }
+
   if (error.code === "ER_DUP_ENTRY") {
-    return res.status(409).json({ message: "That record already exists." });
-  }
-
-  if (error.code === "ER_NO_REFERENCED_ROW_2") {
-    return res.status(400).json({ message: "Referenced product or user does not exist." });
-  }
-
-  if (error.code === "ER_BAD_FIELD_ERROR" || error.code === "ER_NO_SUCH_TABLE") {
-    return res.status(500).json({
-      message: "Database schema mismatch. Check that the cantine_db tables and column names match the SQL schema.",
+    return res.status(409).json({
+      message: "That record already exists.",
     });
   }
 
-  res.status(500).json({ message: "Internal server error." });
+  if (
+    error.code === "ER_NO_REFERENCED_ROW_2" ||
+    error.code === "ER_NO_REFERENCED_ROW"
+  ) {
+    return res.status(400).json({
+      message: "Referenced product or user does not exist.",
+    });
+  }
+
+  if (
+    error.code === "ER_BAD_FIELD_ERROR" ||
+    error.code === "ER_NO_SUCH_TABLE"
+  ) {
+    return res.status(500).json({
+      message:
+        "Database schema mismatch. Ensure all Cantine tables and columns exist in the configured database.",
+    });
+  }
+
+  if (
+    error.code === "ECONNREFUSED" ||
+    error.code === "ETIMEDOUT" ||
+    error.code === "ENOTFOUND" ||
+    error.code === "ECONNRESET"
+  ) {
+    return res.status(503).json({
+      message: "Database is currently unavailable. Check the database connection settings.",
+    });
+  }
+
+  res.status(500).json({
+    message: "Internal server error.",
+  });
 });
 
 // ---------------- START SERVER ----------------
@@ -833,15 +1106,25 @@ app.use((error, req, res, next) => {
 async function startServer() {
   try {
     const connection = await pool.getConnection();
-    await connection.ping();
-    connection.release();
+
+    try {
+      await connection.ping();
+    } finally {
+      connection.release();
+    }
 
     app.listen(PORT, "0.0.0.0", () => {
-      console.log(`Cantine API running at http://localhost:${PORT}`);
-      console.log("Database connected successfully.");
+      console.log(`Cantine API listening on port ${PORT}`);
+      console.log("MySQL database connection successful.");
+      console.log(`Database SSL: ${sslEnabled ? "enabled" : "disabled"}`);
     });
   } catch (error) {
-    console.error("Could not connect to MySQL:", error.message);
+    console.error(
+      "Could not connect to MySQL:",
+      error.code || error.message
+    );
+
+    // Do not log database passwords or complete connection strings.
     process.exit(1);
   }
 }
